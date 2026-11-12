@@ -73,7 +73,6 @@ update_logger.addFilter(my_filter)
 update_logger = logging.getLogger("root")
 update_logger.addFilter(my_filter)
 
-# 定义一个缓存来存储消息
 from collections import defaultdict
 message_cache = defaultdict(lambda: [])
 time_stamps = defaultdict(lambda: [])
@@ -92,7 +91,6 @@ async def command_bot(update, context, title="", has_command=True):
         pass_history = Users.get_config(convo_id, "PASS_HISTORY")
         if message == None:
             message = voice_text
-        # print("message", message)
         if message and len(message) == 1 and is_emoji(message):
             return
 
@@ -106,9 +104,7 @@ async def command_bot(update, context, title="", has_command=True):
 
         if message:
             if pass_history >= 3:
-                # 移除已存在的任务（如果有）
                 remove_job_if_exists(convo_id, context)
-                # 添加新的定时任务
                 context.job_queue.run_once(
                     scheduled_function,
                     when=timedelta(seconds=RESET_TIME),
@@ -169,8 +165,7 @@ async def command_bot(update, context, title="", has_command=True):
                 message = "\n".join(message_cache[convo_id])
                 message_cache[convo_id] = []
                 time_stamps[convo_id] = []
-            # if Users.get_config(convo_id, "TYPING"):
-            #     await context.bot.send_chat_action(chat_id=chatid, message_thread_id=message_thread_id, action=ChatAction.TYPING)
+
             if Users.get_config(convo_id, "TITLE"):
                 title = f"`🤖️ {engine}`\n\n"
             if Users.get_config(convo_id, "REPLY") == False:
@@ -208,22 +203,17 @@ async def delete_message(update, context, messageid = [], delay=60):
                 await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
             except Exception as e:
                 pass
-                # print('\033[31m')
-                # print("delete_message error", e)
-                # print('\033[0m')
 
 from telegram.error import Forbidden, TelegramError
 async def is_bot_blocked(bot, user_id: int) -> bool:
     try:
-        # 尝试向用户发送一条测试消息
         await bot.send_chat_action(chat_id=user_id, action="typing")
-        return False  # 如果成功发送，说明机器人未被封禁
+        return False
     except Forbidden:
         print("error:", user_id, "已封禁机器人")
-        return True  # 如果收到Forbidden错误，说明机器人被封禁
+        return True
     except TelegramError:
-        # 处理其他可能的错误
-        return False  # 如果是其他错误，我们假设机器人未被封禁
+        return False
 
 async def getChatGPT(update_message, context, title, robot, message, chatid, messageid, convo_id, message_thread_id, pass_history=0, api_key=None, api_url=None, engine = None):
     lastresult = title
@@ -246,7 +236,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     if "gemini" in model_name:
         Frequency_Modification = 1
 
-
     if not await is_bot_blocked(context.bot, chatid):
         answer_messageid = (await context.bot.send_message(
             chat_id=chatid,
@@ -259,14 +248,12 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         return
 
     try:
-        # print("text", text)
         async for data in robot.ask_stream_async(text, convo_id=convo_id, pass_history=pass_history, model=model_name, language=language, api_url=api_url, api_key=api_key, system_prompt=system_prompt, plugins=plugins):
-        # for data in robot.ask_stream(text, convo_id=convo_id, pass_history=pass_history, model=model_name):
             if stop_event.is_set() and convo_id == target_convo_id and answer_messageid < reset_mess_id:
                 return
             if "message_search_stage_" not in data:
                 result = result + data
-            image_match = re.search(r"!\[image\]\(data:image\/png;base64,([a-zA-Z0-9+/=]+)\)", result)
+            image_match = re.search(r"![image]\(data:image\/png;base64,([a-zA-Z0-9+/=]+)\)", result)
             if image_match and image_has_send == 0:
                 base64_str = image_match.group(1)
                 try:
@@ -305,8 +292,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             split_len = 3500
             if len(tmpresult) > split_len and Users.get_config(convo_id, "LONG_TEXT_SPLIT"):
                 Frequency_Modification = 40
-
-                # print("tmpresult", tmpresult)
                 replace_text = replace_all(tmpresult, r"(```[\D\d\s]+?```)", split_code)
                 if "@|@|@|@" in replace_text:
                     print("@|@|@|@", replace_text)
@@ -345,25 +330,19 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                             continue
                         else:
                             break
-                    # print("split_messages_new", split_messages_new)
                     send_split_message = ''.join(split_messages_new[:split_index])
                     matches = re.findall(r"(```.*?\n)", send_split_message)
                     if len(matches) % 2 != 0:
                         send_split_message = send_split_message + "```\n"
-                    # print("send_split_message", send_split_message)
                     tmp = ''.join(split_messages_new[split_index:])
                     if tmp.strip().endswith("```"):
                         result = tmp[:-4]
                     else:
                         result = tmp
-                    # print("result", result)
                     matches = re.findall(r"(```.*?\n)", send_split_message)
                     result_matches = re.findall(r"(```.*?\n)", result)
-                    # print("matches", matches)
-                    # print("result_matches", result_matches)
                     if len(result_matches) > 0 and result_matches[0].startswith("```\n") and len(result_matches) >= 2:
                         result = matches[-2] + result
-                    # print("result", result)
 
                 title = ""
                 if lastresult != escape(send_split_message, italic=False):
@@ -409,9 +388,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                     await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
                     lastresult = now_result
                 except Exception as e:
-                    # print('\033[31m')
-                    # print("error: edit_message_text")
-                    # print('\033[0m')
                     continue
     except Exception as e:
         print('\033[31m')
@@ -428,17 +404,13 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             tmpresult = f"{tmpresult}\n\n`{e}`"
     print(tmpresult)
 
-    # 添加图片URL检测和发送
     if image_has_send == 0:
         image_extensions = r'(https?://[^\s<>\"()]+(?:\.(?:webp|jpg|jpeg|png|gif)|/image)[^\s<>\"()]*)'
         image_urls = re.findall(image_extensions, tmpresult, re.IGNORECASE)
         image_urls_result = [url[0] if isinstance(url, tuple) else url for url in image_urls]
         if image_urls_result:
             try:
-                # Limit the number of images to 10 (Telegram limit for albums)
                 image_urls_result = image_urls_result[:10]
-
-                # We send an album with all images
                 media_group = []
                 for img_url in image_urls_result:
                     media_group.append(InputMediaPhoto(media=img_url))
@@ -490,7 +462,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def button_press(update, context):
-    """Function to handle the button press"""
     _, _, _, _, _, _, _, _, convo_id, _, _, _ = await GetMesageInfo(update, context)
     callback_query = update.callback_query
     info_message = update_info_message(convo_id)
@@ -513,7 +484,6 @@ async def button_press(update, context):
                 logger.info(e)
                 pass
         elif data.endswith("_GROUP"):
-            # Processing a click on a group of models
             group_name = data[:-6]
             try:
                 message = await callback_query.edit_message_text(
@@ -650,8 +620,6 @@ async def handle_file(update, context):
 @decorators.Authorization
 @decorators.APICheck
 async def inlinequery(update: Update, context) -> None:
-    """Handle the inline query."""
-
     chatid = update.effective_user.id
     engine = Users.get_config(chatid, "engine")
     query = update.inline_query.query
@@ -665,7 +633,7 @@ async def inlinequery(update: Update, context) -> None:
             InlineQueryResultArticle(
                 id=chatid,
                 title=f"{engine}",
-                thumbnail_url="https://pb.yym68686.top/TTGk",
+                thumbnail_url="[https://pb.yym68686.top/TTGk](https://pb.yym68686.top/TTGk)",
                 description=f"{result}",
                 input_message_content=InputTextMessageContent(escape(result, italic=False), parse_mode='MarkdownV2')),
         ]
@@ -675,7 +643,6 @@ async def inlinequery(update: Update, context) -> None:
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def change_model(update, context):
-    """Quick model change using the command"""
     _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context)
     lang = get_current_lang(convo_id)
 
@@ -689,10 +656,8 @@ async def change_model(update, context):
         )
         return
 
-    # Combine all arguments into one model name
     model_name = ' '.join(context.args)
 
-    # Check if the model name is valid (allowing all common model name characters)
     if not re.match(r'^[a-zA-Z0-9\-_\./:\\@+\s]+$', model_name) or len(model_name) > 100:
         message = await context.bot.send_message(
             chat_id=chatid,
@@ -703,16 +668,13 @@ async def change_model(update, context):
         )
         return
 
-    # Get all available models from initial_model and MODEL_GROUPS
     available_models = get_all_available_models()
     for group_name, models in get_model_groups().items():
         available_models.extend(models)
 
-    # Add debug output
     print(f"Requested model: '{model_name}'")
     print(f"Available models: {available_models}")
 
-    # Check if the requested model is in the available models list
     if model_name not in available_models:
         message = await context.bot.send_message(
             chat_id=chatid,
@@ -723,10 +685,8 @@ async def change_model(update, context):
         )
         return
 
-    # Saving the new model in the user's configuration
     Users.set_config(convo_id, "engine", model_name)
 
-    # Sending a message about changing the model
     message = await context.bot.send_message(
         chat_id=chatid,
         message_thread_id=message_thread_id,
@@ -736,7 +696,6 @@ async def change_model(update, context):
     )
 
 async def scheduled_function(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """这个函数将在RESET_TIME秒后执行一次，重置特定用户的对话"""
     job = context.job
     chat_id = job.chat_id
 
@@ -744,12 +703,9 @@ async def scheduled_function(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     reset_ENGINE(chat_id)
-
-    # 任务执行完毕后自动移除
     remove_job_if_exists(str(chat_id), context)
 
 def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """如果存在，则移除指定名称的任务"""
     current_jobs = context.job_queue.get_jobs_by_name(name)
     if not current_jobs:
         return False
@@ -757,7 +713,6 @@ def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
         job.schedule_removal()
     return True
 
-# 定义一个全局变量来存储 chatid
 target_convo_id = None
 reset_mess_id = 9999
 
@@ -816,7 +771,7 @@ async def info(update, context):
 @decorators.PrintMessage
 @decorators.GroupAuthorization
 @decorators.Authorization
-async def start(update, context): # 当用户输入/start时，返回文本
+async def start(update, context):
     _, _, _, _, _, _, _, _, convo_id, _, _, _ = await GetMesageInfo(update, context)
     user = update.effective_user
     if user.language_code == "zh-hans":
@@ -830,35 +785,17 @@ async def start(update, context): # 当用户输入/start时，返回文本
     message = (
         f"Hi `{user.username}` ! I am an Assistant, a large language model trained by OpenAI. I will do my best to help answer your questions.\n\n"
     )
-    if len(context.args) == 2 and context.args[1].startswith("sk-"):
+    if len(context.args) == 2:
         api_url = context.args[0]
         api_key = context.args[1]
         Users.set_config(convo_id, "api_key", api_key)
         Users.set_config(convo_id, "api_url", api_url)
-        # if GET_MODELS:
-        #     update_initial_model()
 
-    if len(context.args) == 1 and context.args[0].startswith("sk-"):
+    if len(context.args) == 1:
         api_key = context.args[0]
         Users.set_config(convo_id, "api_key", api_key)
-        Users.set_config(convo_id, "api_url", "https://api.openai.com/v1/chat/completions")
-        # if GET_MODELS:
-        #     update_initial_model()
+        Users.set_config(convo_id, "api_url", "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)")
 
-    # message = (
-    #     ">Block quotation started\n"
-    #     ">Block quotation continued\n"
-    #     ">Block quotation continued\n"
-    #     ">Block quotation continued\n"
-    #     ">The last line of the block quotation\n"
-    #     "**>The expandable block quotation started right after the previous block quotation\n"
-    #     ">It is separated from the previous block quotation by an empty bold entity\n"
-    #     ">Expandable block quotation continued\n"
-    #     ">Hidden by default part of the expandable block quotation started\n"
-    #     ">Expandable block quotation continued\n"
-    #     ">The last line of the expandable block quotation with the expandability mark||\n"
-    # )
-    # await update.message.reply_text(message, parse_mode='MarkdownV2', disable_web_page_preview=True)
     await update.message.reply_text(escape(message, italic=False), parse_mode='MarkdownV2', disable_web_page_preview=True)
 
 async def error(update, context):
@@ -874,9 +811,8 @@ async def error(update, context):
 
 @decorators.GroupAuthorization
 @decorators.Authorization
-async def unknown(update, context): # 当用户输入未知命令时，返回文本
+async def unknown(update, context):
     return
-    # await context.bot.send_message(chat_id=update.effective_chat.id, text="Sorry, I didn't understand that command.")
 
 async def post_init(application: Application) -> None:
     if GET_MODELS:
