@@ -10,26 +10,39 @@ from md2tgmd.src.md2tgmd import escape, split_code, replace_all
 from aient.aient.utils.scripts import Document_extract
 from aient.aient.core.utils import get_engine, get_image_message, get_text_message
 
-# Groq / Llama Engine Patch (Globally across all aient modules)
+# Groq / Llama HTTP Interceptor Patch (100% Bypass Model Validation)
+import json as _json
+import httpx as _httpx
 import aient.aient.core.utils as aient_utils
-import aient.aient.models.chatgpt as aient_chatgpt
-_orig_get_engine = aient_utils.get_engine
 
+_orig_get_engine = aient_utils.get_engine
 def _patched_get_engine(provider, endpoint=None, original_model=""):
     engine, stream = _orig_get_engine(provider, endpoint, original_model)
     base_url = str(provider.get("base_url", "")) if isinstance(provider, dict) else ""
-    model_str = str(original_model).lower()
-    if "groq.com" in base_url or "llama" in model_str or "mixtral" in model_str or "gemma" in model_str:
+    if "groq.com" in base_url or "llama" in str(original_model).lower():
         return "gpt", stream
     return engine, stream
 
 aient_utils.get_engine = _patched_get_engine
-aient_chatgpt.get_engine = _patched_get_engine
 get_engine = _patched_get_engine
 
-for mod_name, mod in list(sys.modules.items()):
-    if mod_name.startswith("aient") and hasattr(mod, "get_engine"):
-        setattr(mod, "get_engine", _patched_get_engine)
+_orig_async_send = _httpx.AsyncClient.send
+async def _patched_async_send(self, request, *args, **kwargs):
+    if "groq.com" in str(request.url) and request.content:
+        try:
+            body = _json.loads(request.content.decode("utf-8"))
+            if "model" in body:
+                import config as _cfg
+                configured_model = _cfg.Users.get_config(None, "engine")
+                body["model"] = "llama-3.3-70b-versatile" if (not configured_model or configured_model == "gpt-4o") else configured_model
+                new_content = _json.dumps(body).encode("utf-8")
+                request.headers["content-length"] = str(len(new_content))
+                request._content = new_content
+        except Exception:
+            pass
+    return await _orig_async_send(self, request, *args, **kwargs)
+
+_httpx.AsyncClient.send = _patched_async_send
 
 import config
 from config import (
@@ -425,220 +438,4 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         else:
             tmpresult = f"{tmpresult}\n\n`{e}`"
 
-    if image_has_send == 0:
-        image_extensions = r'(https?://[^\s<>\"()]+(?:\.(?:webp|jpg|jpeg|png|gif)|/image)[^\s<>\"()]*)'
-        image_urls = re.findall(image_extensions, tmpresult, re.IGNORECASE)
-        image_urls_result = [url[0] if isinstance(url, tuple) else url for url in image_urls]
-        if image_urls_result:
-            try:
-                image_urls_result = image_urls_result[:10]
-                media_group = [InputMediaPhoto(media=img_url) for img_url in image_urls_result]
-                await context.bot.send_media_group(
-                    chat_id=chatid,
-                    media=media_group,
-                    message_thread_id=message_thread_id,
-                    reply_to_message_id=messageid,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send image(s): {str(e)}")
-
-    now_result = escape(tmpresult, italic=False)
-    if lastresult != now_result and answer_messageid:
-        if "Can't parse entities: can't find end of code entity at byte offset" in tmpresult:
-            await update_message.reply_text(tmpresult)
-        elif now_result:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chatid,
-                    message_id=answer_messageid,
-                    text=now_result,
-                    parse_mode='MarkdownV2',
-                    disable_web_page_preview=True,
-                    read_timeout=time_out,
-                    write_timeout=time_out,
-                    pool_timeout=time_out,
-                    connect_timeout=time_out
-                )
-            except Exception as e:
-                if "parse entities" in str(e):
-                    await context.bot.edit_message_text(
-                        chat_id=chatid,
-                        message_id=answer_messageid,
-                        text=tmpresult,
-                        disable_web_page_preview=True,
-                        read_timeout=time_out,
-                        write_timeout=time_out,
-                        pool_timeout=time_out,
-                        connect_timeout=time_out
-                    )
-
-@decorators.PrintMessage
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def reset_chat(update, context):
-    global target_convo_id, reset_mess_id
-    _, _, _, chatid, messageid, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    stop_event.set()
-    target_convo_id = convo_id
-    reset_mess_id = messageid
-    message = ' '.join(context.args)
-    reset_ENGINE(convo_id, message)
-    remove_job_if_exists(convo_id, context)
-    await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(strings['message_reset'][get_current_lang(convo_id)]),
-        parse_mode='MarkdownV2',
-    )
-
-@decorators.PrintMessage
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def info(update, context):
-    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    message = update_info_message(convo_id)
-    await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(message, italic=False),
-        parse_mode='MarkdownV2',
-        disable_web_page_preview=True,
-    )
-
-@decorators.PrintMessage
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def start(update, context):
-    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    message, reply_markup = update_first_buttons_message(convo_id)
-    await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(message, italic=False),
-        parse_mode='MarkdownV2',
-        reply_markup=reply_markup,
-    )
-
-@decorators.PrintMessage
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def model(update, context):
-    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    if len(context.args) > 0:
-        model_name = context.args[0]
-        Users.set_config(convo_id, "engine", model_name)
-        await context.bot.send_message(
-            chat_id=chatid,
-            message_thread_id=message_thread_id,
-            text=escape(f"Model switched to: `{model_name}`", italic=False),
-            parse_mode='MarkdownV2',
-        )
-        return
-    reply_markup = update_models_buttons(convo_id)
-    await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(strings['message_model'][get_current_lang(convo_id)], italic=False),
-        parse_mode='MarkdownV2',
-        reply_markup=reply_markup,
-    )
-
-@decorators.PrintMessage
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def settings(update, context):
-    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    reply_markup = update_menu_buttons(convo_id)
-    await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(strings['message_settings'][get_current_lang(convo_id)], italic=False),
-        parse_mode='MarkdownV2',
-        reply_markup=reply_markup,
-    )
-
-async def button_press(update, context):
-    query = update.callback_query
-    await query.answer()
-    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
-    data = query.data
-    if data in get_all_available_models():
-        Users.set_config(convo_id, "engine", data)
-        await query.edit_message_text(
-            text=escape(f"Model switched to: `{data}`", italic=False),
-            parse_mode='MarkdownV2',
-        )
-    elif data in PREFERENCES or data in PLUGINS:
-        current_val = Users.get_config(convo_id, data)
-        if data == "PASS_HISTORY":
-            new_val = 0 if int(current_val) > 2 else 9999
-        else:
-            new_val = not current_val
-        Users.set_config(convo_id, data, new_val)
-        await query.edit_message_reply_markup(reply_markup=update_menu_buttons(convo_id))
-    elif data in LANGUAGES:
-        update_language_status(data, convo_id)
-        await query.edit_message_reply_markup(reply_markup=update_menu_buttons(convo_id))
-
-async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.inline_query.query
-    if not query:
-        return
-    results = [
-        InlineQueryResultArticle(
-            id="1",
-            title="Ask AI",
-            input_message_content=InputTextMessageContent(query),
-        )
-    ]
-    await update.inline_query.answer(results)
-
-async def post_init(application: Application) -> None:
-    if GET_MODELS:
-        try:
-            await get_initial_model()
-        except Exception as e:
-            logger.warning(f"Failed to fetch initial models: {e}")
-    await application.bot.set_my_commands([
-        BotCommand("start", "Start the bot"),
-        BotCommand("reset", "Reset conversation history"),
-        BotCommand("model", "Select AI model"),
-        BotCommand("settings", "Configure bot settings"),
-        BotCommand("info", "Show current bot configuration"),
-    ])
-
-def main():
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .rate_limiter(AIORateLimiter(max_retries=3))
-        .post_init(post_init)
-        .connect_timeout(60)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(60)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset_chat))
-    application.add_handler(CommandHandler("info", info))
-    application.add_handler(CommandHandler("model", model))
-    application.add_handler(CommandHandler("settings", settings))
-    application.add_handler(CommandHandler("chat", lambda u, c: command_bot(u, c, has_command=True)))
-    application.add_handler(CallbackQueryHandler(button_press))
-    application.add_handler(InlineQueryHandler(inlinequery))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, lambda u, c: command_bot(u, c, has_command=False)))
-
-    if WEB_HOOK:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEB_HOOK}/{BOT_TOKEN}",
-        )
-    else:
-        application.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()
+    if ima
