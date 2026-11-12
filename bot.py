@@ -10,16 +10,26 @@ from md2tgmd.src.md2tgmd import escape, split_code, replace_all
 from aient.aient.utils.scripts import Document_extract
 from aient.aient.core.utils import get_engine, get_image_message, get_text_message
 
-# Groq / Llama Engine Patch
+# Groq / Llama Engine Patch (Globally across all aient modules)
 import aient.aient.core.utils as aient_utils
+import aient.aient.models.chatgpt as aient_chatgpt
 _orig_get_engine = aient_utils.get_engine
+
 def _patched_get_engine(provider, endpoint=None, original_model=""):
     engine, stream = _orig_get_engine(provider, endpoint, original_model)
-    if "groq.com" in provider.get("base_url", "") or "llama" in original_model.lower():
+    base_url = str(provider.get("base_url", "")) if isinstance(provider, dict) else ""
+    model_str = str(original_model).lower()
+    if "groq.com" in base_url or "llama" in model_str or "mixtral" in model_str or "gemma" in model_str:
         return "gpt", stream
     return engine, stream
+
 aient_utils.get_engine = _patched_get_engine
+aient_chatgpt.get_engine = _patched_get_engine
 get_engine = _patched_get_engine
+
+for mod_name, mod in list(sys.modules.items()):
+    if mod_name.startswith("aient") and hasattr(mod, "get_engine"):
+        setattr(mod, "get_engine", _patched_get_engine)
 
 import config
 from config import (
