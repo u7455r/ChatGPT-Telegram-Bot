@@ -9,6 +9,18 @@ import utils.decorators as decorators
 from md2tgmd.src.md2tgmd import escape, split_code, replace_all
 from aient.aient.utils.scripts import Document_extract
 from aient.aient.core.utils import get_engine, get_image_message, get_text_message
+
+# Groq / Llama Engine Patch
+import aient.aient.core.utils as aient_utils
+_orig_get_engine = aient_utils.get_engine
+def _patched_get_engine(provider, endpoint=None, original_model=""):
+    engine, stream = _orig_get_engine(provider, endpoint, original_model)
+    if "groq.com" in provider.get("base_url", "") or "llama" in original_model.lower():
+        return "gpt", stream
+    return engine, stream
+aient_utils.get_engine = _patched_get_engine
+get_engine = _patched_get_engine
+
 import config
 from config import (
     WEB_HOOK,
@@ -50,6 +62,8 @@ lock = asyncio.Lock()
 event = asyncio.Event()
 stop_event = asyncio.Event()
 time_out = 600
+target_convo_id = None
+reset_mess_id = 0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger()
@@ -76,6 +90,20 @@ update_logger.addFilter(my_filter)
 from collections import defaultdict
 message_cache = defaultdict(lambda: [])
 time_stamps = defaultdict(lambda: [])
+
+def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.job_queue:
+        return False
+    current_jobs = context.job_queue.get_jobs_by_name(name)
+    if not current_jobs:
+        return False
+    for job in current_jobs:
+        job.schedule_removal()
+    return True
+
+async def scheduled_function(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    reset_ENGINE(job.name)
 
 @decorators.PrintMessage
 @decorators.GroupAuthorization
@@ -105,12 +133,13 @@ async def command_bot(update, context, title="", has_command=True):
         if message:
             if pass_history >= 3:
                 remove_job_if_exists(convo_id, context)
-                context.job_queue.run_once(
-                    scheduled_function,
-                    when=timedelta(seconds=RESET_TIME),
-                    chat_id=chatid,
-                    name=convo_id
-                )
+                if context.job_queue:
+                    context.job_queue.run_once(
+                        scheduled_function,
+                        when=timedelta(seconds=RESET_TIME),
+                        chat_id=chatid,
+                        name=convo_id
+                    )
 
             bot_info_username = None
             try:
@@ -118,7 +147,8 @@ async def command_bot(update, context, title="", has_command=True):
                 bot_info_username = bot_info.username
             except Exception as e:
                 print("error:", e)
-                bot_info_username = update_message.reply_to_message.from_user.username
+                if update_message.reply_to_message and update_message.reply_to_message.from_user:
+                    bot_info_username = update_message.reply_to_message.from_user.username
 
             if update_message.reply_to_message \
             and update_message.from_user.is_bot == False \
@@ -143,7 +173,6 @@ async def command_bot(update, context, title="", has_command=True):
                     import time
                     time_stamps[convo_id].append(time.time())
                     if len(message_cache[convo_id]) == 1:
-                        print("first message len:", len(message_cache[convo_id][0]))
                         if len(message_cache[convo_id][0]) > 800:
                             event.clear()
                         else:
@@ -153,14 +182,7 @@ async def command_bot(update, context, title="", has_command=True):
                 try:
                     await asyncio.wait_for(event.wait(), timeout=2)
                 except asyncio.TimeoutError:
-                    print("asyncio.wait timeout!")
-
-                intervals = [
-                    time_stamps[convo_id][i] - time_stamps[convo_id][i - 1]
-                    for i in range(1, len(time_stamps[convo_id]))
-                ]
-                if intervals:
-                    print(f"Chat ID {convo_id} 时间间隔: {intervals}，总时间：{sum(intervals)}")
+                    pass
 
                 message = "\n".join(message_cache[convo_id])
                 message_cache[convo_id] = []
@@ -187,7 +209,7 @@ async def command_bot(update, context, title="", has_command=True):
 
             await getChatGPT(update_message, context, title, robot, message, chatid, messageid, convo_id, message_thread_id, pass_history, api_key, api_url, engine)
     else:
-        message = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chatid,
             message_thread_id=message_thread_id,
             text=escape(strings['message_command_text_none'][get_current_lang(convo_id)]),
@@ -201,7 +223,7 @@ async def delete_message(update, context, messageid = [], delay=60):
         for mid in messageid:
             try:
                 await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
-            except Exception as e:
+            except Exception:
                 pass
 
 from telegram.error import Forbidden, TelegramError
@@ -210,7 +232,6 @@ async def is_bot_blocked(bot, user_id: int) -> bool:
         await bot.send_chat_action(chat_id=user_id, action="typing")
         return False
     except Forbidden:
-        print("error:", user_id, "已封禁机器人")
         return True
     except TelegramError:
         return False
@@ -231,7 +252,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     Frequency_Modification = 20
     if "gpt-5" in model_name:
         Frequency_Modification = 25
-    if message_thread_id or convo_id.startswith("-"):
+    if message_thread_id or str(convo_id).startswith("-"):
         Frequency_Modification = 35
     if "gemini" in model_name:
         Frequency_Modification = 1
@@ -258,8 +279,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                 base64_str = image_match.group(1)
                 try:
                     img_url = base64.b64decode(base64_str)
-                    media_group = []
-                    media_group.append(InputMediaPhoto(media=img_url))
+                    media_group = [InputMediaPhoto(media=img_url)]
                     await context.bot.send_media_group(
                         chat_id=chatid,
                         media=media_group,
@@ -282,7 +302,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             tmpresult = title + tmpresult
             if "message_search_stage_" in data:
                 tmpresult = strings[data][get_current_lang(convo_id)]
-            history = robot.conversation[convo_id]
+            history = robot.conversation.get(convo_id, [])
             if safe_get(history, -2, "tool_calls", 0, 'function', 'name') == "generate_image" and not image_has_send and safe_get(history, -1, 'content'):
                 image_result = history[-1]['content'].split('\n\n')[1]
                 await context.bot.send_photo(chat_id=chatid, photo=image_result, reply_to_message_id=messageid)
@@ -294,12 +314,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                 Frequency_Modification = 40
                 replace_text = replace_all(tmpresult, r"(```[\D\d\s]+?```)", split_code)
                 if "@|@|@|@" in replace_text:
-                    print("@|@|@|@", replace_text)
                     split_messages = replace_text.split("@|@|@|@")
                     send_split_message = split_messages[0]
                     result = split_messages[1][:-4]
                 else:
-                    print("replace_text", replace_text)
                     if replace_text.strip().endswith("```"):
                         replace_text = replace_text.strip()[:-4]
                     split_messages_new = []
@@ -371,9 +389,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                                 pool_timeout=time_out,
                                 connect_timeout=time_out
                             )
-                            print("error:", send_split_message)
-                        else:
-                            print("error:", str(e))
                 answer_messageid = (await context.bot.send_message(
                     chat_id=chatid,
                     message_thread_id=message_thread_id,
@@ -387,13 +402,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                 try:
                     await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
                     lastresult = now_result
-                except Exception as e:
+                except Exception:
                     continue
     except Exception as e:
-        print('\033[31m')
         traceback.print_exc()
-        print(tmpresult)
-        print('\033[0m')
         api_key = Users.get_config(convo_id, "api_key")
         systemprompt = Users.get_config(convo_id, "systemprompt")
         if api_key:
@@ -402,7 +414,6 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
         else:
             tmpresult = f"{tmpresult}\n\n`{e}`"
-    print(tmpresult)
 
     if image_has_send == 0:
         image_extensions = r'(https?://[^\s<>\"()]+(?:\.(?:webp|jpg|jpeg|png|gif)|/image)[^\s<>\"()]*)'
@@ -411,10 +422,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         if image_urls_result:
             try:
                 image_urls_result = image_urls_result[:10]
-                media_group = []
-                for img_url in image_urls_result:
-                    media_group.append(InputMediaPhoto(media=img_url))
-
+                media_group = [InputMediaPhoto(media=img_url) for img_url in image_urls_result]
                 await context.bot.send_media_group(
                     chat_id=chatid,
                     media=media_group,
@@ -428,472 +436,199 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     if lastresult != now_result and answer_messageid:
         if "Can't parse entities: can't find end of code entity at byte offset" in tmpresult:
             await update_message.reply_text(tmpresult)
-            print(now_result)
         elif now_result:
             try:
-                await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                await context.bot.edit_message_text(
+                    chat_id=chatid,
+                    message_id=answer_messageid,
+                    text=now_result,
+                    parse_mode='MarkdownV2',
+                    disable_web_page_preview=True,
+                    read_timeout=time_out,
+                    write_timeout=time_out,
+                    pool_timeout=time_out,
+                    connect_timeout=time_out
+                )
             except Exception as e:
                 if "parse entities" in str(e):
-                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                    await context.bot.edit_message_text(
+                        chat_id=chatid,
+                        message_id=answer_messageid,
+                        text=tmpresult,
+                        disable_web_page_preview=True,
+                        read_timeout=time_out,
+                        write_timeout=time_out,
+                        pool_timeout=time_out,
+                        connect_timeout=time_out
+                    )
 
-    if Users.get_config(convo_id, "FOLLOW_UP") and tmpresult.strip():
-        if title != "":
-            info = "\n\n".join(tmpresult.split("\n\n")[1:])
-        else:
-            info = tmpresult
-        prompt = (
-            f"You are a professional Q&A expert. You will now be given reference information. Based on the reference information, please help me ask three most relevant questions that you most want to know from my perspective. Be concise and to the point. Do not have numbers in front of questions. Separate each question with a line break. Only output three questions in {language}, no need for any explanation. reference infomation is provided inside <infomation></infomation> XML tags."
-            "Here is the reference infomation, inside <infomation></infomation> XML tags:"
-            "<infomation>"
-            "{}"
-            "</infomation>"
-        ).format(info)
-        result = (await config.SummaryBot.ask_async(prompt, convo_id=convo_id, model=model_name, pass_history=0, api_url=api_url, api_key=api_key)).split('\n')
-        keyboard = []
-        result = [i for i in result if i.strip() and len(i) > 5]
-        print(result)
-        for ques in result:
-            keyboard.append([KeyboardButton(ques)])
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        await update_message.reply_text(text=escape(tmpresult, italic=False), parse_mode='MarkdownV2', reply_to_message_id=messageid, reply_markup=reply_markup)
-        await context.bot.delete_message(chat_id=chatid, message_id=answer_messageid)
-
-@decorators.AdminAuthorization
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def button_press(update, context):
-    _, _, _, _, _, _, _, _, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    callback_query = update.callback_query
-    info_message = update_info_message(convo_id)
-    await callback_query.answer()
-    data = callback_query.data
-    banner = strings['message_banner'][get_current_lang(convo_id)]
-    import telegram
-    try:
-        if data.endswith("_MODELS"):
-            data = data[:-7]
-            Users.set_config(convo_id, "engine", data)
-            try:
-                info_message = update_info_message(convo_id)
-                message = await callback_query.edit_message_text(
-                    text=escape(info_message + banner),
-                    reply_markup=InlineKeyboardMarkup(update_models_buttons(convo_id)),
-                    parse_mode='MarkdownV2'
-                )
-            except Exception as e:
-                logger.info(e)
-                pass
-        elif data.endswith("_GROUP"):
-            group_name = data[:-6]
-            try:
-                message = await callback_query.edit_message_text(
-                    text=escape(info_message + f"\n\n**{strings['group_title'][get_current_lang(convo_id)]}:** `{group_name}`"),
-                    reply_markup=InlineKeyboardMarkup(update_models_buttons(convo_id, group=group_name)),
-                    parse_mode='MarkdownV2'
-                )
-            except Exception as e:
-                logger.info(e)
-                pass
-        elif data.startswith("MODELS"):
-            message = await callback_query.edit_message_text(
-                text=escape(info_message + banner),
-                reply_markup=InlineKeyboardMarkup(update_models_buttons(convo_id)),
-                parse_mode='MarkdownV2'
-            )
-
-        elif data.endswith("_LANGUAGES"):
-            data = data[:-10]
-            update_language_status(data, chat_id=convo_id)
-            try:
-                info_message = update_info_message(convo_id)
-                message = await callback_query.edit_message_text(
-                    text=escape(info_message, italic=False),
-                    reply_markup=InlineKeyboardMarkup(update_menu_buttons(LANGUAGES, "_LANGUAGES", convo_id)),
-                    parse_mode='MarkdownV2'
-                )
-            except Exception as e:
-                logger.info(e)
-                pass
-        elif data.startswith("LANGUAGE"):
-            message = await callback_query.edit_message_text(
-                text=escape(info_message, italic=False),
-                reply_markup=InlineKeyboardMarkup(update_menu_buttons(LANGUAGES, "_LANGUAGES", convo_id)),
-                parse_mode='MarkdownV2'
-            )
-
-        if data.endswith("_PREFERENCES"):
-            data = data[:-12]
-            try:
-                current_data = Users.get_config(convo_id, data)
-                if data == "PASS_HISTORY":
-                    if current_data == 0:
-                        current_data = config.PASS_HISTORY or 9999
-                    else:
-                        current_data = 0
-                    Users.set_config(convo_id, data, current_data)
-                else:
-                    Users.set_config(convo_id, data, not current_data)
-            except Exception as e:
-                logger.info(e)
-            try:
-                info_message = update_info_message(convo_id)
-                message = await callback_query.edit_message_text(
-                    text=escape(info_message, italic=False),
-                    reply_markup=InlineKeyboardMarkup(update_menu_buttons(PREFERENCES, "_PREFERENCES", convo_id)),
-                    parse_mode='MarkdownV2'
-                )
-            except Exception as e:
-                logger.info(e)
-                pass
-        elif data.startswith("PREFERENCES"):
-            message = await callback_query.edit_message_text(
-                text=escape(info_message, italic=False),
-                reply_markup=InlineKeyboardMarkup(update_menu_buttons(PREFERENCES, "_PREFERENCES", convo_id)),
-                parse_mode='MarkdownV2'
-            )
-
-        if data.endswith("_PLUGINS"):
-            data = data[:-8]
-            try:
-                current_data = Users.get_config(convo_id, data)
-                Users.set_config(convo_id, data, not current_data)
-            except Exception as e:
-                logger.info(e)
-            try:
-                info_message = update_info_message(convo_id)
-                message = await callback_query.edit_message_text(
-                    text=escape(info_message, italic=False),
-                    reply_markup=InlineKeyboardMarkup(update_menu_buttons(PLUGINS, "_PLUGINS", convo_id)),
-                    parse_mode='MarkdownV2'
-                )
-            except Exception as e:
-                logger.info(e)
-                pass
-        elif data.startswith("PLUGINS"):
-            message = await callback_query.edit_message_text(
-                text=escape(info_message, italic=False),
-                reply_markup=InlineKeyboardMarkup(update_menu_buttons(PLUGINS, "_PLUGINS", convo_id)),
-                parse_mode='MarkdownV2'
-            )
-
-        elif data.startswith("BACK"):
-            message = await callback_query.edit_message_text(
-                text=escape(info_message, italic=False),
-                reply_markup=InlineKeyboardMarkup(update_first_buttons_message(convo_id)),
-                parse_mode='MarkdownV2'
-            )
-    except telegram.error.BadRequest as e:
-        print('\033[31m')
-        traceback.print_exc()
-        if "Message to edit not found" in str(e):
-            print("error: telegram.error.BadRequest: Message to edit not found!")
-        else:
-            print(f"error: {str(e)}")
-        print('\033[0m')
-
-@decorators.GroupAuthorization
-@decorators.Authorization
-@decorators.APICheck
-async def handle_file(update, context):
-    _, _, image_url, chatid, _, _, _, message_thread_id, convo_id, file_url, _, voice_text = await GetMesageInfo(update, context)
-    robot, role, api_key, api_url = get_robot(convo_id)
-    engine = Users.get_config(convo_id, "engine")
-
-    if file_url == None and image_url:
-        file_url = image_url
-        if Users.get_config(convo_id, "IMAGEQA") == False:
-            return
-    if image_url == None and file_url:
-        image_url = file_url
-    engine_type, _ = get_engine({"base_url": api_url}, endpoint=None, original_model=engine)
-    if robot.__class__.__name__ == "chatgpt":
-        engine_type = "gpt"
-    message = await Document_extract(file_url, image_url, engine_type)
-
-    robot.add_to_conversation(message, role, convo_id)
-
-    if Users.get_config(convo_id, "FILE_UPLOAD_MESS"):
-        message = await context.bot.send_message(chat_id=chatid, message_thread_id=message_thread_id, text=escape(strings['message_doc'][get_current_lang(convo_id)]), parse_mode='MarkdownV2', disable_web_page_preview=True)
-        await delete_message(update, context, [message.message_id])
-
-@decorators.GroupAuthorization
-@decorators.Authorization
-@decorators.APICheck
-async def inlinequery(update: Update, context) -> None:
-    chatid = update.effective_user.id
-    engine = Users.get_config(chatid, "engine")
-    query = update.inline_query.query
-    if (query.endswith('.') or query.endswith('。')) and query.strip():
-        prompt = "Answer the following questions as concisely as possible:\n\n"
-        _, _, _, chatid, _, _, _, _, convo_id, _, _, _ = await GetMesageInfo(update, context)
-        robot, role, api_key, api_url = get_robot(convo_id)
-        result = config.ChatGPTbot.ask(prompt + query, convo_id=convo_id, model=engine, api_url=api_url, api_key=api_key, pass_history=0)
-
-        results = [
-            InlineQueryResultArticle(
-                id=chatid,
-                title=f"{engine}",
-                thumbnail_url="[https://pb.yym68686.top/TTGk](https://pb.yym68686.top/TTGk)",
-                description=f"{result}",
-                input_message_content=InputTextMessageContent(escape(result, italic=False), parse_mode='MarkdownV2')),
-        ]
-
-        await update.inline_query.answer(results)
-
-@decorators.GroupAuthorization
-@decorators.Authorization
-async def change_model(update, context):
-    _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    lang = get_current_lang(convo_id)
-
-    if not context.args:
-        message = await context.bot.send_message(
-            chat_id=chatid,
-            message_thread_id=message_thread_id,
-            text=escape(strings['model_command_usage'][lang]),
-            parse_mode='MarkdownV2',
-            reply_to_message_id=user_message_id,
-        )
-        return
-
-    model_name = ' '.join(context.args)
-
-    if not re.match(r'^[a-zA-Z0-9\-_\./:\\@+\s]+$', model_name) or len(model_name) > 100:
-        message = await context.bot.send_message(
-            chat_id=chatid,
-            message_thread_id=message_thread_id,
-            text=escape(strings['model_name_invalid'][lang]),
-            parse_mode='MarkdownV2',
-            reply_to_message_id=user_message_id,
-        )
-        return
-
-    available_models = get_all_available_models()
-    for group_name, models in get_model_groups().items():
-        available_models.extend(models)
-
-    print(f"Requested model: '{model_name}'")
-    print(f"Available models: {available_models}")
-
-    if model_name not in available_models:
-        message = await context.bot.send_message(
-            chat_id=chatid,
-            message_thread_id=message_thread_id,
-            text=escape(strings['model_not_available'][lang].format(model_name=model_name)),
-            parse_mode='MarkdownV2',
-            reply_to_message_id=user_message_id,
-        )
-        return
-
-    Users.set_config(convo_id, "engine", model_name)
-
-    message = await context.bot.send_message(
-        chat_id=chatid,
-        message_thread_id=message_thread_id,
-        text=escape(strings['model_changed'][lang].format(model_name=model_name), italic=False),
-        parse_mode='MarkdownV2',
-        reply_to_message_id=user_message_id,
-    )
-
-async def scheduled_function(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    chat_id = job.chat_id
-
-    if config.ADMIN_LIST and chat_id in config.ADMIN_LIST:
-        return
-
-    reset_ENGINE(chat_id)
-    remove_job_if_exists(str(chat_id), context)
-
-def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    current_jobs = context.job_queue.get_jobs_by_name(name)
-    if not current_jobs:
-        return False
-    for job in current_jobs:
-        job.schedule_removal()
-    return True
-
-target_convo_id = None
-reset_mess_id = 9999
-
+@decorators.PrintMessage
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def reset_chat(update, context):
     global target_convo_id, reset_mess_id
-    _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    reset_mess_id = user_message_id
-    target_convo_id = convo_id
+    _, _, _, chatid, messageid, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
     stop_event.set()
-    message = None
-    if (len(context.args) > 0):
-        message = ' '.join(context.args)
-    reset_ENGINE(target_convo_id, message)
-
-    remove_keyboard = ReplyKeyboardRemove()
-    message = await context.bot.send_message(
+    target_convo_id = convo_id
+    reset_mess_id = messageid
+    message = ' '.join(context.args)
+    reset_ENGINE(convo_id, message)
+    remove_job_if_exists(convo_id, context)
+    await context.bot.send_message(
         chat_id=chatid,
         message_thread_id=message_thread_id,
         text=escape(strings['message_reset'][get_current_lang(convo_id)]),
-        reply_markup=remove_keyboard,
         parse_mode='MarkdownV2',
     )
-    if GET_MODELS:
-        robot, role, api_key, api_url = get_robot()
-        engine = Users.get_config(convo_id, "engine")
-        provider = {
-            "provider": "openai",
-            "base_url": api_url,
-            "api": api_key,
-            "model": [engine],
-            "tools": True,
-            "image": True
-        }
-        config.initial_model = remove_no_text_model(await update_initial_model(provider))
-    await delete_message(update, context, [message.message_id, user_message_id])
 
-@decorators.AdminAuthorization
+@decorators.PrintMessage
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def info(update, context):
-    _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, voice_text = await GetMesageInfo(update, context)
-    info_message = update_info_message(convo_id)
-    message = await context.bot.send_message(
+    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
+    message = update_info_message(convo_id)
+    await context.bot.send_message(
         chat_id=chatid,
         message_thread_id=message_thread_id,
-        text=escape(info_message, italic=False),
-        reply_markup=InlineKeyboardMarkup(update_first_buttons_message(convo_id)),
+        text=escape(message, italic=False),
         parse_mode='MarkdownV2',
         disable_web_page_preview=True,
-        read_timeout=600,
     )
-    await delete_message(update, context, [message.message_id, user_message_id])
 
 @decorators.PrintMessage
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def start(update, context):
-    _, _, _, _, _, _, _, _, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    user = update.effective_user
-    if user.language_code == "zh-hans":
-        update_language_status("Simplified Chinese", chat_id=convo_id)
-    elif user.language_code == "zh-hant":
-        update_language_status("Traditional Chinese", chat_id=convo_id)
-    elif user.language_code == "ru":
-        update_language_status("Russian", chat_id=convo_id)
-    else:
-        update_language_status("English", chat_id=convo_id)
-    message = (
-        f"Hi `{user.username}` ! I am an Assistant, a large language model trained by OpenAI. I will do my best to help answer your questions.\n\n"
+    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
+    message, reply_markup = update_first_buttons_message(convo_id)
+    await context.bot.send_message(
+        chat_id=chatid,
+        message_thread_id=message_thread_id,
+        text=escape(message, italic=False),
+        parse_mode='MarkdownV2',
+        reply_markup=reply_markup,
     )
-    if len(context.args) == 2:
-        api_url = context.args[0]
-        api_key = context.args[1]
-        Users.set_config(convo_id, "api_key", api_key)
-        Users.set_config(convo_id, "api_url", api_url)
 
-    if len(context.args) == 1:
-        api_key = context.args[0]
-        Users.set_config(convo_id, "api_key", api_key)
-        Users.set_config(convo_id, "api_url", "[https://api.openai.com/v1/chat/completions](https://api.openai.com/v1/chat/completions)")
-
-    await update.message.reply_text(escape(message, italic=False), parse_mode='MarkdownV2', disable_web_page_preview=True)
-
-async def error(update, context):
-    traceback_string = traceback.format_exception(None, context.error, context.error.__traceback__)
-    if "telegram.error.TimedOut: Timed out" in traceback_string:
-        logger.warning('error: telegram.error.TimedOut: Timed out')
-        return
-    if "Message to be replied not found" in traceback_string:
-        logger.warning('error: telegram.error.BadRequest: Message to be replied not found')
-        return
-    logger.warning('Update "%s" caused error "%s"', update, context.error)
-    logger.warning('Error traceback: %s', ''.join(traceback_string))
-
+@decorators.PrintMessage
 @decorators.GroupAuthorization
 @decorators.Authorization
-async def unknown(update, context):
-    return
+async def model(update, context):
+    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
+    if len(context.args) > 0:
+        model_name = context.args[0]
+        Users.set_config(convo_id, "engine", model_name)
+        await context.bot.send_message(
+            chat_id=chatid,
+            message_thread_id=message_thread_id,
+            text=escape(f"Model switched to: `{model_name}`", italic=False),
+            parse_mode='MarkdownV2',
+        )
+        return
+    reply_markup = update_models_buttons(convo_id)
+    await context.bot.send_message(
+        chat_id=chatid,
+        message_thread_id=message_thread_id,
+        text=escape(strings['message_model'][get_current_lang(convo_id)], italic=False),
+        parse_mode='MarkdownV2',
+        reply_markup=reply_markup,
+    )
+
+@decorators.PrintMessage
+@decorators.GroupAuthorization
+@decorators.Authorization
+async def settings(update, context):
+    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
+    reply_markup = update_menu_buttons(convo_id)
+    await context.bot.send_message(
+        chat_id=chatid,
+        message_thread_id=message_thread_id,
+        text=escape(strings['message_settings'][get_current_lang(convo_id)], italic=False),
+        parse_mode='MarkdownV2',
+        reply_markup=reply_markup,
+    )
+
+async def button_press(update, context):
+    query = update.callback_query
+    await query.answer()
+    _, _, _, chatid, _, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context, voice=False)
+    data = query.data
+    if data in get_all_available_models():
+        Users.set_config(convo_id, "engine", data)
+        await query.edit_message_text(
+            text=escape(f"Model switched to: `{data}`", italic=False),
+            parse_mode='MarkdownV2',
+        )
+    elif data in PREFERENCES or data in PLUGINS:
+        current_val = Users.get_config(convo_id, data)
+        if data == "PASS_HISTORY":
+            new_val = 0 if int(current_val) > 2 else 9999
+        else:
+            new_val = not current_val
+        Users.set_config(convo_id, data, new_val)
+        await query.edit_message_reply_markup(reply_markup=update_menu_buttons(convo_id))
+    elif data in LANGUAGES:
+        update_language_status(data, convo_id)
+        await query.edit_message_reply_markup(reply_markup=update_menu_buttons(convo_id))
+
+async def inlinequery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query.query
+    if not query:
+        return
+    results = [
+        InlineQueryResultArticle(
+            id="1",
+            title="Ask AI",
+            input_message_content=InputTextMessageContent(query),
+        )
+    ]
+    await update.inline_query.answer(results)
 
 async def post_init(application: Application) -> None:
     if GET_MODELS:
-        await get_initial_model()
+        try:
+            await get_initial_model()
+        except Exception as e:
+            logger.warning(f"Failed to fetch initial models: {e}")
     await application.bot.set_my_commands([
-        BotCommand('info', 'Basic information'),
-        BotCommand('reset', 'Reset the bot'),
-        BotCommand('start', 'Start the bot'),
-        BotCommand('model', 'Change AI model'),
+        BotCommand("start", "Start the bot"),
+        BotCommand("reset", "Reset conversation history"),
+        BotCommand("model", "Select AI model"),
+        BotCommand("settings", "Configure bot settings"),
+        BotCommand("info", "Show current bot configuration"),
     ])
-    description = (
-        "I am an Assistant, a large language model trained by OpenAI. I will do my best to help answer your questions."
-    )
-    await application.bot.set_my_description(description)
 
-if __name__ == '__main__':
+def main():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
-        .connection_pool_size(65536)
-        .get_updates_connection_pool_size(65536)
-        .read_timeout(time_out)
-        .write_timeout(time_out)
-        .connect_timeout(time_out)
-        .pool_timeout(time_out)
-        .get_updates_read_timeout(time_out)
-        .get_updates_write_timeout(time_out)
-        .get_updates_connect_timeout(time_out)
-        .get_updates_pool_timeout(time_out)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(AIORateLimiter(max_retries=3))
         .post_init(post_init)
+        .connect_timeout(60)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(60)
         .build()
     )
 
-    application.add_handler(CommandHandler("info", info))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset_chat))
-    application.add_handler(CommandHandler("model", change_model))
-    application.add_handler(InlineQueryHandler(inlinequery))
+    application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("model", model))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CommandHandler("chat", lambda u, c: command_bot(u, c, has_command=True)))
     application.add_handler(CallbackQueryHandler(button_press))
-    application.add_handler(MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, lambda update, context: command_bot(update, context, has_command=False), block = False))
-    application.add_handler(MessageHandler(
-        filters.CAPTION &
-        (
-            (filters.PHOTO & ~filters.COMMAND) |
-            (
-                filters.Document.PDF |
-                filters.Document.TXT |
-                filters.Document.DOC |
-                filters.Document.FileExtension("jpg") |
-                filters.Document.FileExtension("jpeg") |
-                filters.Document.FileExtension("png") |
-                filters.Document.FileExtension("md") |
-                filters.Document.FileExtension("py") |
-                filters.Document.FileExtension("yml")
-            )
-        ), lambda update, context: command_bot(update, context, has_command=False)))
-    application.add_handler(MessageHandler(
-        ~filters.CAPTION &
-        (
-            (filters.PHOTO & ~filters.COMMAND) |
-            (
-                filters.Document.PDF |
-                filters.Document.TXT |
-                filters.Document.DOC |
-                filters.Document.FileExtension("jpg") |
-                filters.Document.FileExtension("jpeg") |
-                filters.Document.FileExtension("png") |
-                filters.Document.FileExtension("md") |
-                filters.Document.FileExtension("py") |
-                filters.Document.FileExtension("yml") |
-                filters.AUDIO |
-                filters.Document.FileExtension("wav")
-            )
-        ), handle_file))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
-    application.add_error_handler(error)
+    application.add_handler(InlineQueryHandler(inlinequery))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, lambda u, c: command_bot(u, c, has_command=False)))
 
     if WEB_HOOK:
-        print("WEB_HOOK:", WEB_HOOK)
-        application.run_webhook("0.0.0.0", PORT, webhook_url=WEB_HOOK)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEB_HOOK}/{BOT_TOKEN}",
+        )
     else:
-        application.run_polling(timeout=time_out)
+        application.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
